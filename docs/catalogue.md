@@ -61,7 +61,7 @@ All are settings (`--set doctor.disk.warn_gb=60`); the defaults are first cuts t
 | `doctor.incidents.enabled` / `max_rows` / `tail_kb` / `ledger_max_kb` | true / 50 / 512 / 8192 | incident rows ([incidents.md](incidents.md)): off writes none; rows made per run (the rest counted as omitted); how much of the ledger's end is read to tell which ids it holds; the size at which the ledger refuses new rows (it is never rotated) |
 | `doctor.for_s.incident-unreadable` | 120 | an input an incident rule could not read must stay unreadable this long before it is a row; the incident rules themselves confirm at once, because their own records date them |
 | `doctor.tick_budget_ms` | 2000 | local checks are held to this; the cost is reported in `doctor.json` (`cost.incidents_ms` is the incident fold) |
-| `advice.budget.*` | `wall_s` 30, `cpu_s_per_hour` 30, `load_per_core_max` 0.8, `battery_min_pct` 30, `battery_wall_s` 10 | what an advice run may cost and when it steps aside, saying so: [advice.md](advice.md#what-a-run-costs-and-when-it-steps-aside) |
+| `advice.budget.*` | `wall_s` 30, `cpu_s_per_hour` 40, `load_per_core_max` 0.8, `battery_min_pct` 30, `battery_wall_s` 10 | what an advice run may cost and when it steps aside, saying so: [advice.md](advice.md#what-a-run-costs-and-when-it-steps-aside) |
 | `doctor.repair.*` | | rate limits, breakers, flap detection and plan expiry for live repair: [repairs.md](repairs.md#settings-doctorrepair) |
 
 ## Per-OS reach

@@ -5,6 +5,15 @@ All notable changes to this project are recorded here. The format follows
 [semantic versioning](https://semver.org/). Schema versions (`infirmary.verdict`, `infirmary.evidence`,
 `infirmary.replay`) are versioned separately from the tool.
 
+## [0.4.2] - 2026-10-16
+
+- **The advise job's default CPU budget is 40 CPU-seconds an hour, not 30.** An install that runs `advise` every 120 s on a Mac measured 1.6 CPU-seconds
+  for a full run (95th percentile 2.5; 0.28 on Linux), so 30 allowed about 19 full runs of the 30 an hour, as few as 14, and 179 of 651 runs in 22 hours
+  stepped aside on `cpu budget used` (another 102 on load, which is unchanged). At 40 it is about 25 an hour and in the resampling never fewer than 21, using at most about 1.2%
+  of one core. The budget still stops a runaway: it caps the hour at about four fifths of what running every cycle in full would cost. An install that sets
+  `advice.budget.cpu_s_per_hour` itself is not affected. The accounting was checked and does not over-count (each child once, a skipped run's 0.01 to 0.03
+  CPU-s included). Measurements and method: [docs/advice.md](docs/advice.md#what-a-run-costs-measured).
+
 ## [0.4.1] - 2026-10-16
 
 - **macOS and Windows read their own process table.** `dead` and `wedged` need the agent's process identity and CPU, which came only from

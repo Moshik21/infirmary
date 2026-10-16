@@ -34,7 +34,7 @@ command (below).
 
 ## Status and intent
 
-**Status.** Version 0.4.1. 0.4.0 was the first public release. This is early software, written against one fleet's incidents and maintained by one person.
+**Status.** Version 0.4.2. 0.4.0 was the first public release. This is early software, written against one fleet's incidents and maintained by one person.
 
 - `stall-explain` and `infirmary check` run on Linux and WSL2. macOS and Windows are partial: many rows there report `unknown` or are designed but not yet run, and a Mac was not measured. Do not run `scripts/test` on a Mac ([Platforms](#platforms)).
 - It is advice-only by default. Live repair has never been run on a live fleet; it has only run against synthetic homes and shim owners, and it is off unless an operator turns it on.
@@ -230,10 +230,11 @@ a run on the fixtures' synthetic home (21 lanes, 105 alarms; the whole advise ru
 0.4 KB (100 alarms a day is about 110 KB a day), the ledger read once per run at about 11 ms for each MiB; the one extra read is the names and times
 of the files in a lane's own inbox ([docs/judged.md](docs/judged.md)).
 
-The advise run keeps its own cost down: a wall-time budget (30 s), a CPU budget (30 CPU-seconds an hour) and a back-off when the machine's 5-minute load per
+The advise run keeps its own cost down: a wall-time budget (30 s), a CPU budget (40 CPU-seconds an hour) and a back-off when the machine's 5-minute load per
 core is above 0.8 or it is on battery below 30%, in which case it says `skipped on purpose: load 0.90 per core (limit 0.80)` instead of running ([docs/advice.md](docs/advice.md#what-a-run-costs-and-when-it-steps-aside)).
 Measured on a Linux/WSL2 machine (24 cores): 2.2 s wall, 0.28 CPU-seconds and 35 MB for one run over a real home with 13 alarms, 0.02 s and 0.01 to 0.02 CPU-seconds
-over the fixtures' synthetic home; a Mac was not measured.
+over the fixtures' synthetic home. On a Mac (8 cores, a run every 120 s, from an install's own log) a full run used 1.6 CPU-seconds on average and 2.5 at the
+95th percentile, so the default CPU budget of 40 an hour allows about 25 full runs of the 30 an hour, at most about 1.2% of one core ([docs/advice.md](docs/advice.md#what-a-run-costs-measured)).
 
 ## Platforms
 

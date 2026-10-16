@@ -124,7 +124,7 @@ DEFAULTS = {
         "budget": {                    # what a run may cost, and when it steps aside, saying so (docs/advice.md, "What a run costs")
             "enabled": True,           # off: no limit, no back-off (a person's override for one run: --set advice.budget.enabled=false)
             "wall_s": 30,              # one run's wall time: the explanations stop here and the run says how many alarms it left
-            "cpu_s_per_hour": 30,      # CPU-seconds (this process and what it waited for) all the runs of the last hour may use; past it the run does not start
+            "cpu_s_per_hour": 40,     # CPU-seconds (this process and what it waited for) all the runs of the last hour may use; past it the run does not start
             "load_per_core_max": 0.8,  # the 5-minute load average per core above which the run does not start
             "battery_min_pct": 30,     # on battery below this charge the run does not start ...
             "battery_wall_s": 10,      # ... and on battery above it the wall budget is cut to this

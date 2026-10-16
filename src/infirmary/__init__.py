@@ -1,6 +1,6 @@
 """infirmary: explain why an agent lane is quiet, and keep a fleet healthy through its owners' own safe repairs."""
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 # Schema versions are separate from the tool version: a reader of `infirmary.verdict 1.x`
 # keeps working across tool releases.

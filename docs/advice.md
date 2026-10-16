@@ -50,7 +50,7 @@ its battery. All of it is in `advice.budget` and can be set with `--set`; the nu
 | Setting | Default | What it does |
 | --- | ---: | --- |
 | `wall_s` | 30 | One run's wall time. The check goes first (it has its own bounds: `doctor.tick_budget_ms` and `doctor.remote_budget_ms`); the explanations stop when the time is used up, and the run says how many alarms (and lanes asked again now) it left unexplained |
-| `cpu_s_per_hour` | 30 | CPU-seconds, this process and the programs it waited for (`os.times()`), that all the runs of the last hour may use together. Past it the run does not start |
+| `cpu_s_per_hour` | 40 | CPU-seconds, this process and the programs it waited for (`os.times()`), that all the runs of the last hour may use together. Past it the run does not start |
 | `load_per_core_max` | 0.8 | The machine's 5-minute load average divided by its cores. Above it the run does not start. A 5-minute average, because the run's own previous pass is in the 1-minute one |
 | `battery_min_pct` | 30 | On battery (not on mains) below this charge the run does not start |
 | `battery_wall_s` | 10 | On battery at or above that charge the run goes ahead with its wall budget cut to this |
@@ -61,7 +61,7 @@ its battery. All of it is in `advice.budget` and can be set with `--set`; the nu
 line of `advice.txt` (`skipped on purpose: load 0.90 per core (limit 0.80); nothing was checked or explained this run, and that is not a pass`),
 the card (status `unknown`, headline `skipped on purpose: load 0.90 per core (limit 0.80); ...`, so the tile cannot look current and fine), and the
 actions log (`budget` and `budget_reason` on the advise row). The other reasons read `on battery at 12% (floor 30%)` and
-`cpu budget used: 1.3 of 30 cpu-seconds in the last hour`. A run that is shortened says `shortened on purpose: on battery at 80%: wall budget cut
+`cpu budget used: 41.3 of 40 cpu-seconds in the last hour`. A run that is shortened says `shortened on purpose: on battery at 80%: wall budget cut
 to 10 s`, and one that was cut by its wall budget says `cut short on purpose: ... N alarm(s) and M lane(s) ... were not explained` (the card counts both) and turns an otherwise
 `ok` card to `unknown`. Under `--quiet` the scheduled entry prints nothing, as before; the files and the log carry the words.
 
@@ -87,11 +87,28 @@ Method: the one the README's cost section uses, `infirmary advise` run by hand a
 | a real home, 13 alarms in the window, 17 checks | 2.2 to 2.3 s (the check is about 2.1 s of it; the alarms are the rest) | 0.28 CPU-s | 34.5 to 34.9 MB |
 | the fixtures' synthetic home, 6 alarms | 0.02 s | 0.01 to 0.02 CPU-s | 28.7 MB |
 
-At the default ten-minute cadence that is six runs an hour: about 1.7 CPU-seconds an hour on the real home, 6% of the default CPU budget of 30; the
+At the default ten-minute cadence that is six runs an hour: about 1.7 CPU-seconds an hour on the real home, 4% of the default CPU budget of 40; the
 wall budget of 30 s is about thirteen times the run. **Machine**: Linux 6.18 under WSL2, 24 logical cores (a laptop-class Intel CPU), 24 GB, Python 3.14,
-on mains power, 5-minute load per core 0.07 while measuring. **A Mac was not measured**: the macOS readings (`sysctl vm.loadavg`, `hw.ncpu`, `pmset -g batt`)
-are parsed from documented output and run against shims on Linux only, so what a run costs on a Mac and how the back-off reads there are not known from a
-run. The Windows readings do not exist; the budget there is the wall and CPU limits alone.
+on mains power, 5-minute load per core 0.07 while measuring. **Not measured by that method on a Mac or Windows.** The Windows readings do not exist; the budget there is the wall and CPU limits alone.
+
+**On a Mac, from a real install's own log** (the actions log's `cpu_s` on each advise row; 8 cores, the author's supervisor home, a run every 120 s, 651 runs over
+22 hours, the machine busy at a 5-minute load of 7 to 8 for much of it): a full run used **1.6 CPU-seconds on average** (median 1.5, 95th percentile 2.5, largest 3.6)
+in 2.3 s of wall time, about six times the 0.28 CPU-s measured on Linux; the cause was not isolated. That install ran 0.3.0, before 0.4.1 made a Mac read its process
+table with `ps` ([verdicts.md](verdicts.md#process-evidence-by-platform)), so a run on 0.4.1 may cost more and is not measured here. A run that stepped aside used 0.01 CPU-s. Of the 651 runs, 370 ran in full and 281 stepped aside: 179 because
+the CPU budget (then 30) was used up, 102 because the load was over the limit.
+
+**Why the CPU budget is 40.** A run every 120 s is 30 chances an hour, and "at least every other one" is 15 full runs an hour. At 1.6 CPU-s a run that is 24 CPU-s;
+at the 95th-percentile cost of 2.5 it is 37; the budget is 40 for that, the skipped runs' own cost (15 x 0.01) and some margin. The old 30 was just enough for the
+average run and not for a bad hour (resampling the 370 measured costs over thousands of hours: 19 full runs an hour on average, as few as 14); 40 gives 25 on average
+and, in that resampling, never fewer than 21. The accounting itself was checked and is not the cause: a run is counted once (`os.times()` of the process plus the children it waited for, so
+each `ps`, `git` or `ssh` once), and a skipped run counts its 0.01 to 0.03 CPU-s. It under-counts slightly, by the interpreter's start-up and imports before the
+run's clock begins (about 0.07 CPU-s measured).
+
+**The cost, stated.** At 40 CPU-s an hour the advise job uses at most 1.1% of one core on average over an hour (0.14% of an 8-core Mac); one run may start just under
+the limit, so the worst hour in the resampling was 43.5 CPU-s, 1.2% of a core. Running every cycle in full would cost about 48 CPU-s an hour on this Mac (1.3%): the
+budget still stops a runaway at about four fifths of that, and a run that gets slower (more alarms, a slow `ps`, an `ssh` that hangs) is held to the same 40 CPU-s
+an hour, so the cadence thins instead of the cost growing. The load limit is a separate safeguard and is unchanged: on a busy machine (a 5-minute load per core
+above 0.8, which is the case on that Mac for hours at a time) the runs step aside whatever the CPU budget is, and a larger budget does not bring them back.
 
 ## The files
 
