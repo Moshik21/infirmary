@@ -315,7 +315,7 @@ def build_refusals(root):
 
 
 def main():
-    out = os.path.abspath(sys.argv[1])
+    out = os.path.realpath(sys.argv[1])   # install records the home's real path (a Mac's temp directory is a symlink), so the expected paths are real too
     os.makedirs(out, exist_ok=True)
     scs = []
     for name, fn in (("window", build_window), ("rotated", build_rotated), ("install", build_install), ("launchd", build_launchd), ("refusals", build_refusals), ("budget", build_budget)):

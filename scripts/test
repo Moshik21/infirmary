@@ -646,7 +646,7 @@ def _main(args, tmp):
     with open(os.path.join(fx, "scripts", "self-audit"), "a") as fh:
         fh.write("# zebrafruit\n")
     own = run([os.path.join(ROOT, "scripts", "self-audit"), "--exempt", "NONE", "--denylist", os.path.join(tmp, "dl-one.txt"), fx])
-    check(own.returncode == 1 and "scripts/self-audit:" in own.stdout and "zebrafruit" in own.stdout, "self-audit: a denylisted name inside the script itself is reported")
+    check(own.returncode == 1 and os.path.join("scripts", "self-audit") + ":" in own.stdout and "zebrafruit" in own.stdout, "self-audit: a denylisted name inside the script itself is reported")
     with open(os.path.join(tmp, "dl-hit.txt"), "w") as fh:
         fh.write("stall-explain\n")
     pkg = run([os.path.join("scripts", "build-package"), "--out", os.path.join(tmp, "dist"), "--denylist", os.path.join(tmp, "dl-one.txt"), "--denylist", os.path.join(tmp, "dl-hit.txt")])
@@ -682,10 +682,18 @@ def _main(args, tmp):
     demo = os.path.join(tmp, "fleet")
     run([os.path.join("examples", "demo-fleet", "make_demo.py"), demo], env, expect=0)
     lanes = ["--set", "files.lanes=" + os.path.join(demo, "lanes.json")]
-    for lane, code in (("lane-finished", 10), ("lane-waiting", 0), ("lane-gone", 40)):
+    for lane, code in (("lane-finished", 10), ("lane-waiting", 0)):
         res = run([se, lane] + lanes + ["--json"], env, expect=code)
         check(res.returncode == code and json.loads(res.stdout)["exit_code"] == code, "%s exits %d and says so in --json" % (lane, code))
-    check(run([se, "lane-quiet", "--idle-s", "3600"] + lanes, env).returncode == 30, "an hour of silence with nothing behind it is wedged (30)")
+    if os.path.isdir("/proc/self"):
+        res = run([se, "lane-gone"] + lanes + ["--json"], env, expect=40)
+        check(res.returncode == 40 and json.loads(res.stdout)["exit_code"] == 40, "lane-gone exits 40 and says so in --json")
+        check(run([se, "lane-quiet", "--idle-s", "3600"] + lanes, env).returncode == 30, "an hour of silence with nothing behind it is wedged (30)")
+    else:   # dead and wedged need the process read, which is /proc only: here it is unavailable, and the answer must say so, not guess
+        for lane, extra in (("lane-gone", []), ("lane-quiet", ["--idle-s", "3600"])):
+            res = run([se, lane] + extra + lanes + ["--json"], env, expect=50)
+            check(res.returncode == 50 and "process unavailable" in json.loads(res.stdout)["why"],
+                  "%s is unknown (50) without /proc, and says the process could not be read" % lane)
     check(run([se, "no-such-lane"] + lanes, env).returncode == 2, "an unknown lane is a usage error (2)")
     run([fd, "off"], env, expect=0)
     res = run([se, "lane-finished"] + lanes, env)
