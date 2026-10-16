@@ -46,6 +46,18 @@ Issues are the useful feedback: a verdict that looks wrong, a check that reads `
 
 **Intent.** Most alarms from long-running agent lanes are not stuck workers. Infirmary answers "why is this lane quiet?" with one line and the evidence behind it. It is deterministic, makes no model calls and reads local records. It advises, and it does not act unless an operator opts in. It is deliberately not a monitor, not a restarter and not an alert router.
 
+## Known issues
+
+What is open today, in one line each. The status above says the same in more words.
+
+- Live repair has never been run on a live fleet; it has only run against synthetic homes and shim owners ([docs/safety.md](docs/safety.md#live-repair-the-operators-switch)).
+- On macOS and Windows the process evidence comes from `/proc`, which does not exist there, so a lane that is gone or silent reads `unknown` (exit 50), not `dead` or `wedged` ([Platforms](#platforms)).
+- The macOS LaunchAgent install has been run only against a `launchctl` shim on Linux, not on a real Mac ([Platforms](#platforms)).
+- `scripts/test` must not be run on your own Mac: it can write real LaunchAgent plists into `~/Library/LaunchAgents` ([Platforms](#platforms)).
+- The 88.5% replay accuracy is measured on alarms the rules were written against, so it is not a held-out figure ([docs/accuracy.md](docs/accuracy.md)).
+- It ships no adapter for a specific tool, only the example in `examples/adapter/files-home/`; the scheduled advise run and the incident rules do nothing for you until you write one ([docs/sources.md](docs/sources.md)).
+- Python 3.9 and 3.10 have not been run, and macOS with Python 3.8 is not in the CI matrix ([Platforms](#platforms)).
+
 ## Five-minute quickstart
 
 Needs Python 3.8 or newer. No install, no dependencies. Two words you will meet: a **lane** is one long-running agent session (one
