@@ -39,7 +39,7 @@ command (below).
 - `stall-explain` and `infirmary check` run on Linux and WSL2. macOS and Windows are partial: many rows there report `unknown` or are designed but not yet run, and a Mac was not measured. Do not run `scripts/test` on a Mac ([Platforms](#platforms)).
 - It is advice-only by default. Live repair has never been run on a live fleet; it has only run against synthetic homes and shim owners, and it is off unless an operator turns it on.
 - The 88.5% replay accuracy comes from one fleet's alarms, which the rules were written against. Read it as a description, not a forecast ([Measured accuracy](#measured-accuracy)).
-- The hosted CI matrix across Linux, macOS and Windows is a manual workflow and has not yet passed anywhere.
+- The hosted CI matrix across Linux, macOS and Windows is a manual workflow. Its first run (2026-10-16) passed the whole suite on Ubuntu (Python 3.8 and 3.13) and failed 3 checks each on macOS (3.13) and Windows (3.8 and 3.13); those are not fixed yet ([Platforms](#platforms)).
 - It ships no adapter for a specific tool, only the example in `examples/adapter/files-home/`.
 
 Issues are the useful feedback: a verdict that looks wrong, a check that reads `unknown` on your machine, a platform it fails on, or a first run that confused you ([SUPPORT.md](SUPPORT.md)).
@@ -242,7 +242,7 @@ not a three-OS smoke: it has been run to a pass on Linux and WSL2 only. **Do not
 macOS the default scheduler is launchd, so a run there wrote real LaunchAgent plists into your `~/Library/LaunchAgents` (the install scenario now asks for cron
 explicitly, which has not been confirmed on a Mac), and a run on a Mac failed 13 of its checks. On Windows the scenarios that use POSIX shims are skipped by design, and the suite has not
 been run there. `.github/workflows/ci.yml` runs the suite on all three systems, by hand only
-(`workflow_dispatch`), so the matrix is a way to find out, not a record of a pass.
+(`workflow_dispatch`), so the matrix is a way to find out, not a record of a pass. The first hosted run (2026-10-16): Ubuntu with Python 3.8 and 3.13 passed every check; macOS with Python 3.13 failed 3 (one scheduler-install scenario, `lane-gone` exits 40, and the one-hour-silence `wedged` exit); Windows with Python 3.8 and 3.13 failed 3 each (a self-audit denylist check, `lane-gone` exits 40, and the `wedged` exit). They have not been investigated, so do not read them as proven defects or as proven fine. The macOS 3.8 cell is not in the matrix.
 
 ## Honesty
 
