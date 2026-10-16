@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""A fake Lookout command: `lookout-capture ingest --source ID` writes the feed it reads on stdin to $INFIRMARY_CAPTURE."""
+import os
+import sys
+
+with open(os.environ["INFIRMARY_CAPTURE"], "w") as fh:
+    fh.write(sys.stdin.read())
+print("ok seq=1")

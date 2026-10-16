@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+"""The approved test set, run end to end through the public commands only (no tests of internals).
+
+    python3 scripts/test [--denylist FILE ...]
+
+1. the self-audit, as a test
+2. behavioural fixtures: replay of the invented alarm set against hand-written expected verdicts
+3. the Infirmary's fixture scenarios (the generic ones, and the example adapters' under examples/adapter/*/fixtures): synthetic /proc trees and home trees, recorded tool output behind fake shims,
+   each replayed through `bin/infirmary` (check, plan, approve, reset, on, off) with the findings (and the look-alikes it
+   must leave alone), the repairs it ran or refused, its actions log and its plans compared
+4. a smoke run: start, one explanation, --json, the exit codes, the kill switch, a refused unknown lane, and the repair verbs
+   (repair mode under --no-write only advises, an unknown plan is refused, a bad mode or a promoted action is a usage error)
+5. scripts/merged-check on a scratch git repository: two branches clean alone whose merge fails the audit, a conflicting merge,
+   a clean merge, and nothing left behind
+
+Everything writes to a temporary directory, removed at the end, also when the suite is stopped with SIGTERM or SIGHUP
+(`--keep` leaves it and prints where). Exit 0 when all pass.
+Standard library only.
+"""
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PY = sys.executable
+FAILS = []
+
+
+def run(args, env=None, expect=None):
+    full = dict(os.environ, **(env or {}))
+    res = subprocess.run([PY] + args, capture_output=True, text=True, env=full, cwd=ROOT, timeout=60)
+    if expect is not None and res.returncode != expect:
+        FAILS.append("%s: exit %d, wanted %d\n%s%s" % (" ".join(args), res.returncode, expect, res.stdout, res.stderr))
+    return res
+
+
+# ---- the Infirmary's fixture scenarios ------------------------------------------------------------------------------
+def tree_digest(path, skip=()):
+    """A digest of every file under path (relative name, size, mtime, content), leaving out the directories in `skip`: the read-only
+    proof compares two."""
+    h = hashlib.sha1()
+    for base, dirs, names in sorted(os.walk(path)):
+        if any(base == x or base.startswith(x + os.sep) for x in skip):
+            continue
+        for n in sorted(names):
+            p = os.path.join(base, n)
+            try:
+                st = os.lstat(p)
+                h.update(("%s %d %d\n" % (os.path.relpath(p, path), st.st_size, st.st_mtime_ns)).encode())
+                if os.path.isfile(p) and not os.path.islink(p):
+                    with open(p, "rb") as fh:
+                        h.update(fh.read())
+            except OSError:
+                h.update(b"?")
+    return h.hexdigest()
+
+
+def start_servers(specs):
+    """A listener that accepts and stays silent, one that greets like sshd, a port nothing listens on, and one that answers a single GET with a file (`http`) or a 403."""
+    env, socks = {}, []
+    for spec in specs:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        if spec["kind"] == "closed":
+            s.close()
+        else:
+            s.listen(8)
+            socks.append(s)
+
+            def serve(sock=s, kind=spec["kind"], spec=spec):
+                held = []
+                while True:
+                    try:
+                        c, _ = sock.accept()
+                    except OSError:
+                        return
+                    if kind == "banner":
+                        try:
+                            c.sendall(b"SSH-2.0-fixture\r\n")
+                        except OSError:
+                            pass
+                    if kind in ("http", "http-refuses"):      # one GET, answered with the file the spec names (or 403), and closed
+                        try:
+                            c.settimeout(2)
+                            c.recv(4096)
+                            body = open(spec["body_file"], "rb").read() if kind == "http" else b"refused"
+                            c.sendall(("HTTP/1.0 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % ("200 OK" if kind == "http" else "403 Forbidden", len(body))).encode() + body)
+                        except OSError:
+                            pass
+                        c.close()
+                        continue
+                    held.append(c)
+            threading.Thread(target=serve, daemon=True).start()
+        env[spec["env"]] = str(port)
+    return env, socks
+
+
+def finding_ids(doc, pending=False):
+    return sorted(f["id"] for f in doc["findings"] if bool(f["pending"]) == pending)
+
+
+def doctor_expect(name, exp, res, doc, state, text):
+    bad = []
+    if "exit" in exp and res.returncode != exp["exit"]:
+        bad.append("exit %d, wanted %d" % (res.returncode, exp["exit"]))
+    for sub in exp.get("text_has", []):
+        if sub not in res.stdout:
+            bad.append("output lacks %r" % sub)
+    for sub in exp.get("stdout_lacks", []):
+        if sub in res.stdout:
+            bad.append("output holds %r" % sub)
+    if doc is not None:
+        if "findings" in exp and finding_ids(doc) != sorted(exp["findings"]):
+            bad.append("findings %s, wanted %s" % (finding_ids(doc), sorted(exp["findings"])))
+        if "pending" in exp and finding_ids(doc, True) != sorted(exp["pending"]):
+            bad.append("pending %s, wanted %s" % (finding_ids(doc, True), sorted(exp["pending"])))
+        for cid, st in (exp.get("checks_state") or {}).items():
+            got = [c["state"] for c in doc["checks"] if c["check"] == cid]
+            if got != [st]:
+                bad.append("check %s is %s, wanted %s" % (cid, got, st))
+        for host, want in (exp.get("flags") or {}).items():
+            row = doc["flags"].get(host)
+            for k, v in want.items():
+                if row is None or row.get(k) != v:
+                    bad.append("flag %s.%s is %s, wanted %s" % (host, k, None if row is None else row.get(k), v))
+        for sub in exp.get("evidence_has", []):
+            if not any(sub in e["fact"] for f in doc["findings"] for e in f["evidence"]):
+                bad.append("no evidence mentions %r" % sub)
+        if exp.get("dry_run_outputs") is not None:
+            n = sum(1 for f in doc["findings"] for h in ([f.get("how")] + f.get("hows", [])) if h and h.get("dry_run_output"))
+            if n != exp["dry_run_outputs"]:
+                bad.append("%d dry-run output(s) attached, wanted %d" % (n, exp["dry_run_outputs"]))
+        for sub in exp.get("how_has", []):
+            if not any(sub in (h.get("note", "") + " ".join(h.get("dry_run") or [])) for f in doc["findings"] for h in ([f.get("how")] + f.get("hows", [])) if h):
+                bad.append("no finding's how mentions %r" % sub)
+    if doc is not None:
+        bad += repair_expect(exp, doc, state, docs_only=True)
+    att = exp.get("ssh_attempts")
+    if att:        # the fake ssh logs the alias of every attempt: how many connections were made, per alias
+        try:
+            rows = open(att["path"]).read().split()
+        except OSError:
+            rows = []
+        for alias, n in att["counts"].items():
+            if rows.count(alias) != n:
+                bad.append("%d ssh attempt(s) to %s, wanted %d" % (rows.count(alias), alias, n))
+    if exp.get("findings_none") and doc is not None and doc["findings"]:
+        bad.append("expected no findings")
+    dj = exp.get("doctor_json")
+    if dj:
+        path = os.path.join(state, "doctor.json")
+        try:
+            d = json.load(open(path))
+            if d.get("schema") != dj["schema"] or d.get("status") != dj["status"] or dj["flags_host"] not in d.get("flags", {}):
+                bad.append("doctor.json has the wrong shape or status")
+        except (OSError, ValueError):
+            bad.append("doctor.json was not written")
+    if exp.get("state_empty") and os.path.isdir(state) and [n for n in os.listdir(state) if n != "seen.json.tmp"]:
+        bad.append("state directory is not empty: %s" % sorted(os.listdir(state)))
+    if exp.get("state_only") is not None and os.path.isdir(state):
+        extra = sorted(n for n in os.listdir(state) if n not in exp["state_only"])
+        if extra:
+            bad.append("state directory holds more than %s: %s" % (exp["state_only"], extra))
+    fd = exp.get("feed")
+    if fd:
+        try:
+            feed = json.load(open(fd["path"]))
+            ids = [c["id"] for c in feed["collectors"]]
+            if feed["schema"] != "lookout.feed" or feed["source"]["id"] != fd["source"] or not re.match(r"^[a-z0-9][a-z0-9._-]{0,47}$", feed["source"]["id"]):
+                bad.append("feed envelope is wrong")
+            if fd.get("label_has") and fd["label_has"] not in feed["source"].get("label", ""):
+                bad.append("the feed's source label %r does not show the mode %r" % (feed["source"].get("label"), fd["label_has"]))
+            if len(feed["attention"]) > 30 or any(c["kind"] not in ("machine", "service", "disk", "capacity", "info", "decision") for c in feed["attention"]):
+                bad.append("feed cards break the limits or use an unknown kind")
+            for sub in fd["cards"]:
+                if not any(sub in c["title"] for c in feed["attention"]):
+                    bad.append("no card titled like %r" % sub)
+            for cid, n in (fd.get("card_ids") or {}).items():      # one card per distinct unknown: the id appears exactly this many times
+                got = sum(1 for c in feed["attention"] if c["id"] == cid)
+                if got != n:
+                    bad.append("%d card(s) with id %s, wanted %d" % (got, cid, n))
+            for pre in fd.get("no_card_id_prefix", []):
+                if any(c["id"].startswith(pre) for c in feed["attention"]):
+                    bad.append("a card id starts with %r, wanted none" % pre)
+            for sub in fd.get("card_detail_has", []):
+                if not any(sub in c["detail"] for c in feed["attention"]):
+                    bad.append("no card detail mentions %r" % sub)
+            for cid, sub in (fd.get("collector_warning_has") or {}).items():
+                if not any(c["id"] == cid and any(sub in w for w in c.get("warnings") or []) for c in feed["collectors"]):
+                    bad.append("collector %s has no warning mentioning %r" % (cid, sub))
+            for cid in fd.get("collector_error_has", {}):
+                if not any(c["id"] == cid and fd["collector_error_has"][cid] in c.get("error", "") for c in feed["collectors"]):
+                    bad.append("collector %s has no error mentioning %r" % (cid, fd["collector_error_has"][cid]))
+            if fd.get("card_severity") and not all(c["severity"] == fd["card_severity"] for c in feed["attention"]):
+                bad.append("card severity differs from %s" % fd["card_severity"])
+            if not all(c.get("how") for c in feed["attention"]):
+                bad.append("a card has no how")
+            for cid in fd.get("collector_ok", []):
+                if not any(c["id"] == cid and c["status"] == "ok" for c in feed["collectors"]):
+                    bad.append("collector %s is not ok in the feed" % cid)
+            for host, hs in (fd.get("machine_health") or {}).items():
+                if not any(m["id"] == host and m.get("health", {}).get("state") == hs for m in feed["machines"]):
+                    bad.append("machine %s is not reported %s" % (host, hs))
+        except (OSError, ValueError, KeyError) as exc:
+            bad.append("the pushed feed is missing or malformed: %s" % exc)
+    return bad
+
+
+CARD_TOOL = re.compile(r"^[a-z0-9][a-z0-9._-]{0,47}$")
+CARD_TIME = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$")
+
+
+def card_problems(path):
+    """The rules of lookout.card 1.0 (the board's schema), checked from the file a tool wrote."""
+    try:
+        if os.path.getsize(path) > 16384:
+            return ["%s is over 16 KiB" % path]
+        c = json.load(open(path))
+    except (OSError, ValueError) as exc:
+        return ["%s is not a readable card: %s" % (path, exc)]
+    bad = []
+    for k in ("schema", "schema_version", "tool", "title", "status", "headline", "updated_at"):
+        if k not in c:
+            bad.append("card lacks %s" % k)
+    if c.get("schema") != "lookout.card" or not re.match(r"^1\.[0-9]{1,4}$", str(c.get("schema_version"))):
+        bad.append("card is not lookout.card 1.x")
+    if not CARD_TOOL.match(str(c.get("tool"))) or not 1 <= len(c.get("title") or "") <= 60 or not 1 <= len(c.get("headline") or "") <= 160:
+        bad.append("card tool, title or headline breaks the limits")
+    if c.get("status") not in ("ok", "warn", "bad", "unknown") or not CARD_TIME.match(str(c.get("updated_at"))):
+        bad.append("card status or updated_at is malformed")
+    nums = c.get("numbers") or []
+    if len(nums) > 6 or any(not 1 <= len(n.get("label") or "") <= 32 or not isinstance(n.get("value"), (int, float, str)) or
+                            (isinstance(n["value"], str) and len(n["value"]) > 32) for n in nums):
+        bad.append("card numbers break the limits")
+    if "mode" in c and not re.match(r"^[a-z][a-z0-9-]{0,23}$", str(c["mode"])):
+        bad.append("card mode is malformed")
+    if "stale_after_s" in c and not (isinstance(c["stale_after_s"], int) and 60 <= c["stale_after_s"] <= 604800):
+        bad.append("card stale_after_s is out of range")
+    return bad
+
+
+def _dotted(node, dotted):
+    for part in dotted.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node
+
+
+def file_expect(exp):
+    """Expectations on files a run left behind: `file_has` / `file_lacks` (substrings), `file_equals` (same bytes as another file),
+    `file_count` (how many lines hold a substring), `json_file` (dotted values), `card_valid`, `glob_count`. A path with `*` must match one file."""
+    bad = []
+
+    def text(path):
+        if "*" in path:         # a pattern names exactly one file (a LaunchAgent's name carries a hash)
+            found = glob.glob(path)
+            if len(found) != 1:
+                bad.append("%d file(s) match %s, wanted 1" % (len(found), path))
+                return None
+            path = found[0]
+        try:
+            return open(path, encoding="utf-8").read()
+        except OSError:
+            bad.append("%s cannot be read" % path)
+            return None
+    for path, subs in (exp.get("file_has") or {}).items():
+        t = text(path)
+        bad += ["%s lacks %r" % (path, sub) for sub in subs if t is not None and sub not in t]
+    for path, subs in (exp.get("file_lacks") or {}).items():
+        t = text(path) if os.path.exists(path) or "*" in path else ""
+        bad += ["%s holds %r" % (path, sub) for sub in subs if t is not None and sub in t]
+    for path, other in (exp.get("file_equals") or {}).items():
+        a, b = text(path), text(other)
+        if a is not None and b is not None and a != b:
+            bad.append("%s differs from %s" % (path, other))
+    for path, counts in (exp.get("file_count") or {}).items():
+        t = text(path)
+        for sub, n in (counts.items() if t is not None else ()):
+            got = sum(1 for line in t.splitlines() if sub in line)
+            if got != n:
+                bad.append("%s has %d line(s) holding %r, wanted %d" % (path, got, sub, n))
+    for path, want in (exp.get("json_file") or {}).items():
+        try:
+            doc = json.load(open(path))
+        except (OSError, ValueError) as exc:
+            bad.append("%s is not readable JSON: %s" % (path, exc))
+            continue
+        bad += ["%s: %s is %r, wanted %r" % (path, k, _dotted(doc, k), v) for k, v in want.items() if _dotted(doc, k) != v]
+    for path in exp.get("card_valid") or []:
+        bad += card_problems(path)
+    for pattern, n in (exp.get("glob_count") or {}).items():
+        if len(glob.glob(pattern)) != n:
+            bad.append("%d file(s) match %s, wanted %d" % (len(glob.glob(pattern)), pattern, n))
+    return bad
+
+
+def json_has(exp, doc):
+    """`json_has`: dotted names into the document the command printed (`live_repair.enabled`) and the values they must hold."""
+    bad = []
+    for dotted, want in (exp.get("json_has") or {}).items():
+        node = doc
+        for part in dotted.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        if node != want:
+            bad.append("%s is %r, wanted %r" % (dotted, node, want))
+    return bad
+
+
+def _plans(state):
+    out = []
+    for path in sorted(glob.glob(os.path.join(state, "plans", "*.json"))):
+        try:
+            out.append(json.load(open(path)))
+        except (OSError, ValueError):
+            pass
+    return sorted(out, key=lambda p: p.get("created_epoch", 0))
+
+
+def _log_rows(state):
+    try:
+        return [json.loads(l) for l in open(os.path.join(state, "actions.jsonl")) if l.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def substitute(arg, state):
+    """`{plan:ACTION}` is the newest plan of that action (its id is a hash the scenario cannot know in advance)."""
+    m = re.match(r"^\{plan:([a-z0-9-]+)\}$", arg)
+    if not m:
+        return arg
+    ps = [p for p in _plans(state) if p.get("action") == m.group(1)]
+    return ps[-1]["id"] if ps else "no-plan-for-" + m.group(1)
+
+
+def repair_expect(exp, doc, state, new_rows=None, docs_only=False, rows_only=False):
+    """Repair outcomes, the actions log, plans and breakers, as the public command reported and wrote them. A check's
+    document is judged once with `docs_only` (from doctor_expect) and its log rows once with `rows_only`."""
+    keys = ("log", "log_lacks", "readings")
+    exp = dict((k, v) for k, v in exp.items() if (k in keys) == bool(rows_only)) if (docs_only or rows_only) else exp
+    bad = []
+    rep = doc.get("repairs") if isinstance(doc.get("repairs"), dict) else doc
+    outs = rep.get("outcomes") if isinstance(rep, dict) and isinstance(rep.get("outcomes"), list) else None
+    if "repairs" in exp:
+        got = sorted([o["action"], o["outcome"]] for o in (outs or []))
+        if got != sorted(exp["repairs"]):
+            bad.append("repairs %s, wanted %s (%s)" % (got, sorted(exp["repairs"]), "; ".join(o["reason"] for o in outs or [])[:400]))
+    if "outcome" in exp and doc.get("outcome") != exp["outcome"]:
+        bad.append("outcome %s, wanted %s (%s)" % (doc.get("outcome"), exp["outcome"], doc.get("reason")))
+    reasons = [o["reason"] for o in (outs or [])] + ([doc["reason"]] if isinstance(doc.get("reason"), str) else [])
+    for sub in exp.get("reason_has", []):
+        if not any(sub in r for r in reasons):
+            bad.append("no reason mentions %r (reasons: %s)" % (sub, " | ".join(reasons)[:400]))
+    for name, want in (exp.get("breakers") or {}).items():
+        got = ((rep or {}).get("breakers") or {}).get(name, {}).get("tripped")
+        if got != want:
+            bad.append("breaker %s tripped=%s, wanted %s" % (name, got, want))
+    rows = new_rows if new_rows is not None else []
+    for want in exp.get("log", []):
+        if not any(all(r.get(k) == v for k, v in want.items()) for r in rows):
+            bad.append("actions log has no row like %s (kinds written: %s)" % (want, sorted(set((r.get("kind"), r.get("outcome")) for r in rows), key=str)))
+    for kind in exp.get("log_lacks", []):
+        if any(r.get("kind") == kind for r in rows):
+            bad.append("actions log has a %r row it must not have" % kind)
+    if exp.get("readings"):
+        runs = [r for r in rows if r.get("kind") == "repair"]
+        if not runs or not all(r.get("reading_1") and r.get("reading_2") and r.get("acted_at") for r in runs):
+            bad.append("a repair row lacks its two readings")
+        elif any((r["acted_at"] - r["reading_2"]["at"]) * 1000 > exp["readings"] for r in runs):
+            bad.append("more than %d ms between the last reading and the act" % exp["readings"])
+    for action, want in (exp.get("plans") or {}).items():
+        ps = [p for p in _plans(state) if p.get("action") == action]
+        got = ps[-1].get("state") if ps else None
+        if got != want:
+            bad.append("plan for %s is %s, wanted %s" % (action, got, want))
+    return bad
+
+
+def run_doctor_scenarios(builder, tmp):
+    label = os.path.relpath(builder, ROOT)
+    out = os.path.join(tmp, "fx-" + hashlib.sha1(builder.encode()).hexdigest()[:6])
+    res = subprocess.run([PY, builder, out], capture_output=True, text=True, cwd=ROOT, timeout=300)
+    if res.returncode != 0:
+        check(False, "%s builds its fixtures (%s)" % (label, res.stderr.strip()[-300:]))
+        return
+    scenarios = json.load(open(os.path.join(out, "scenarios.json")))["scenarios"]
+    fd = os.path.join(ROOT, "bin", "infirmary")
+    for sc in scenarios:
+        env_extra, socks = start_servers(sc.get("servers") or [])
+        state = os.path.join(tmp, "state-" + re.sub(r"\W", "_", sc["name"]))
+        bad = []
+        trees = {}
+        for i, rn in enumerate(sc["runs"]):
+            env = dict(os.environ, INFIRMARY_STATE=state, INFIRMARY_CONFIG=os.path.join(tmp, "none.json"))
+            env.pop("INFIRMARY", None)
+            env.update(env_extra)
+            env.update(rn.get("env") or {})
+            for fid, ago in (rn.get("seen") or {}).items():
+                os.makedirs(state, exist_ok=True)
+                try:
+                    cur = json.load(open(os.path.join(state, "seen.json")))
+                except (OSError, ValueError):
+                    cur = {}
+                now = time.time()
+                cur[fid] = {"first": now - ago["first_ago"], "last": now - ago["last_ago"]}
+                json.dump(cur, open(os.path.join(state, "seen.json"), "w"))
+            for act in rn.get("setup") or []:
+                if "write_state" in act:
+                    os.makedirs(state, exist_ok=True)
+                    json.dump(act["json"], open(os.path.join(state, act["write_state"]), "w"))
+                if "seed_runs" in act:      # earlier repairs, `ago_s` seconds before now, in the Infirmary's own repair memory
+                    os.makedirs(state, exist_ok=True)
+                    hist = {"runs": [], "breakers": {}}
+                    for ago in act["seed_runs"]["ago_s"]:
+                        hist["runs"].append({"ts": int(time.time() - ago), "action": act["seed_runs"]["action"], "findings": [act["seed_runs"]["finding"]],
+                                             "outcome": act["seed_runs"]["outcome"]})
+                    json.dump(hist, open(os.path.join(state, "repairs.json"), "w"))
+                if "drop_head" in act:      # a log trimmed from the head, as a rotation leaves it
+                    with open(act["drop_head"], encoding="utf-8") as fh:
+                        lines = fh.readlines()
+                    with open(act["drop_head"], "w", encoding="utf-8") as fh:
+                        fh.writelines(lines[act["lines"]:])
+                if "write_file" in act:     # a file rewritten between two runs (the load average a minute later)
+                    os.makedirs(os.path.dirname(act["write_file"]), exist_ok=True)
+                    with open(act["write_file"], "w", encoding="utf-8") as fh:
+                        fh.write(act["text"])
+                if "edit_plan" in act:      # a plan file changed by hand after it was written
+                    ps = [p for p in _plans(state) if p.get("action") == act["edit_plan"]]
+                    if ps:
+                        ps[-1].update(act["set"])
+                        json.dump(ps[-1], open(os.path.join(state, "plans", ps[-1]["id"] + ".json"), "w"))
+            exp = rn["expect"]
+            for path in exp.get("unchanged", []):
+                trees[path] = tree_digest(path)
+            for u in exp.get("unchanged_but", []):
+                trees["but:" + u["path"]] = tree_digest(u["path"], set(u.get("except") or []))
+            before = len(_log_rows(state))
+            args = [re.sub(r"\{port:([A-Z0-9_]+)\}", lambda m: env_extra[m.group(1)], substitute(a, state)) for a in rn["args"]] + ([] if rn.get("text") or rn["args"][0] != "check" else ["--json"])
+            r = subprocess.run([PY, fd] + args, capture_output=True, text=True, env=env, cwd=ROOT, timeout=120)
+            new_rows = _log_rows(state)[before:]
+            doc = None
+            if args and "--json" in args:
+                try:
+                    doc = json.loads(r.stdout)
+                except ValueError:
+                    bad.append("run %d: output is not JSON: %s" % (i + 1, (r.stdout + r.stderr)[-300:]))
+            doc = doc if isinstance(doc, dict) else None if doc is None else {"listing": doc}
+            check_doc = doc if doc is not None and "findings" in doc else None   # plan, approve and status print documents of their own
+            bad += ["run %d: %s" % (i + 1, b) for b in doctor_expect(sc["name"], exp, r, check_doc, state, rn.get("text"))]
+            bad += ["run %d: %s" % (i + 1, b) for b in repair_expect(exp, doc if check_doc is None and doc is not None else {}, state, new_rows,
+                                                                    rows_only=check_doc is not None)]
+            bad += ["run %d: %s" % (i + 1, b) for b in json_has(exp, doc)]
+            for path in exp.get("unchanged", []):
+                if tree_digest(path) != trees[path]:
+                    bad.append("run %d: the Infirmary changed something under %s" % (i + 1, path))
+            for u in exp.get("unchanged_but", []):
+                if tree_digest(u["path"], set(u.get("except") or [])) != trees["but:" + u["path"]]:
+                    bad.append("run %d: the Infirmary changed something under %s outside %s" % (i + 1, u["path"], u.get("except") or "nothing"))
+            bad += ["run %d: %s" % (i + 1, b) for b in file_expect(exp)]
+            for path, want in (exp.get("files") or {}).items():
+                if os.path.exists(path) != want:
+                    bad.append("run %d: %s %s" % (i + 1, path, "is missing" if want else "should not exist"))
+        for s in socks:
+            s.close()
+        check(not bad, "doctor/%s: %s" % (os.path.basename(label.split(os.sep + "fixtures")[0]) if "fixtures" in label else "generic", sc["name"]) + ("" if not bad else "\n      " + "\n      ".join(bad)))
+
+
+# ---- scripts/merged-check on a scratch repository ------------------------------------------------------------------------
+def merged_check_scenarios(tmp):
+    repo_vars = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                 "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH")
+    clean = {k: v for k, v in os.environ.items() if k not in repo_vars}
+    clean["GIT_CONFIG_GLOBAL"] = os.devnull
+
+    def sh(cwd, *argv, env=None):
+        res = subprocess.run(list(argv), cwd=cwd, capture_output=True, text=True, timeout=120, env=dict(clean, **(env or {})))
+        if res.returncode != 0 and argv[0] == "git":
+            FAILS.append("scratch repo: %s: %s" % (" ".join(argv), res.stderr))
+        return res
+
+    ident = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    base = os.path.join(tmp, "mc")
+    scratch_tmp = os.path.join(base, "tmp")   # merged-check's scratch directories go here, so leftovers can be seen
+    origin, work = os.path.join(base, "origin.git"), os.path.join(base, "work")
+    os.makedirs(scratch_tmp)
+    sh(base, "git", "init", "-q", "--bare", "-b", "main", origin)
+    sh(base, "git", "clone", "-q", origin, work)
+    os.makedirs(os.path.join(work, "scripts"))
+    shutil.copy(os.path.join(ROOT, "scripts", "self-audit"), os.path.join(work, "scripts", "self-audit"))
+    with open(os.path.join(work, "scripts", "test"), "w") as fh:   # the scratch repository's suite: passes
+        fh.write("#!/usr/bin/env python3\nprint('suite ran')\n")
+    with open(os.path.join(work, "README.md"), "w") as fh:
+        fh.write("# Scratch\n\nOne line of prose.\n")
+    with open(os.path.join(work, "LICENSE"), "w") as fh:   # the one file the audit exempts from the name checks by default
+        fh.write("".join("Line %d of the licence notes.\n" % i for i in range(1, 9)))
+
+    def commit(msg):
+        sh(work, "git", "add", "-A", env=ident)
+        sh(work, "git", "commit", "-q", "-m", msg, env=ident)
+
+    sh(work, "git", "checkout", "-q", "-b", "main")
+    commit("base")
+    sh(work, "git", "push", "-q", "origin", "main")
+    scratch_deny = os.path.join(base, "scratch-denylist.txt")
+    with open(scratch_deny, "w") as fh:
+        fh.write("zebrafruit\n")
+    sh(work, "git", "checkout", "-q", "-b", "adds-a-name", "main")   # adds a denylisted name to the exempt file: allowed there
+    with open(os.path.join(work, "LICENSE"), "a") as fh:
+        fh.write("This licence names zebrafruit.\n")   # a name on the scratch repository's denylist
+    commit("licence notes name a word")
+    sh(work, "git", "checkout", "-q", "-b", "moves-the-notes", "main")   # moves the file out of the exempt place: allowed while the notes name nothing
+    os.makedirs(os.path.join(work, "docs", "x"))
+    sh(work, "git", "mv", "LICENSE", os.path.join("docs", "x", "notes.md"))
+    commit("move the notes into docs")
+    sh(work, "git", "checkout", "-q", "-b", "unrelated", "main")
+    with open(os.path.join(work, "docs-extra.md"), "w") as fh:
+        fh.write("Something else.\n")
+    commit("an unrelated doc")
+    sh(work, "git", "checkout", "-q", "main")
+
+    def mc(*argv, env=None):
+        full = dict(clean, TMPDIR=scratch_tmp, **ident)
+        full.pop("MERGED_CHECK_DENYLIST", None)
+        full.update(env or {})
+        if "--denylist" not in argv and "MERGED_CHECK_DENYLIST" not in full:
+            argv = argv + ("--denylist", scratch_deny)
+        return subprocess.run([PY, os.path.join(ROOT, "scripts", "merged-check")] + list(argv), cwd=work, capture_output=True, text=True, timeout=300, env=full)
+
+    def verdict(res):
+        return res.stdout.strip()
+
+    head_before, status_before = sh(work, "git", "rev-parse", "HEAD").stdout, sh(work, "git", "status", "--porcelain").stdout
+    for branch in ("adds-a-name", "moves-the-notes"):
+        res = mc("--head", branch)
+        check(res.returncode == 0 and verdict(res) == "merged-check: ok", "merged-check: %s passes alone on main (%s)" % (branch, verdict(res)))
+    res = mc("--head", "unrelated")
+    check(res.returncode == 0 and verdict(res) == "merged-check: ok", "merged-check: a clean merge exits 0 and says ok (%s)" % verdict(res))
+    sh(work, "git", "push", "-q", "origin", "moves-the-notes:main")   # main moves: the other branch is now checked on the new main
+    res = mc("--head", "adds-a-name")
+    check(res.returncode == 1 and verdict(res).startswith("merged-check: FAILED self-audit: ") and "docs/x/notes.md" in verdict(res) and "denylisted name" in verdict(res),
+          "merged-check: two branches clean alone fail merged, on the audit's first finding (%s)" % verdict(res))
+    check(len(verdict(res).splitlines()) == 1, "merged-check: one verdict line on stdout")
+    res = mc("--head", "adds-a-name", "--test-cmd", "false", "--base", "origin/main")
+    check(res.returncode == 1 and verdict(res).startswith("merged-check: FAILED self-audit: "), "merged-check: the audit fails before the suite runs")
+    # a failing suite is named as the suite's failure (the audit is clean here: the head is unrelated)
+    res = mc("--head", "unrelated", "--test-cmd", "echo FAIL a scenario; exit 3")
+    check(res.returncode == 1 and verdict(res) == "merged-check: FAILED tests: a scenario", "merged-check: a failing suite fails the verdict (%s)" % verdict(res))
+    # a denylisted name, by flag and by environment variable
+    deny = os.path.join(base, "denylist.txt")
+    with open(deny, "w") as fh:
+        fh.write("Line 3\n")
+    res = mc("--head", "unrelated", "--denylist", deny)
+    check(res.returncode == 1 and "denylisted name" in verdict(res), "merged-check: --denylist reaches the audit (%s)" % verdict(res))
+    res = mc("--head", "unrelated", env={"MERGED_CHECK_DENYLIST": deny})
+    check(res.returncode == 1 and "denylisted name" in verdict(res), "merged-check: MERGED_CHECK_DENYLIST reaches the audit (%s)" % verdict(res))
+    res = mc("--head", "unrelated", "--denylist", scratch_deny, "--denylist", deny)
+    check(res.returncode == 1 and "denylisted name" in verdict(res) and "Line 3" in verdict(res), "merged-check: a second --denylist reaches the audit too (%s)" % verdict(res))
+    res = mc("--head", "unrelated", env={"MERGED_CHECK_DENYLIST": os.pathsep.join([scratch_deny, deny])})
+    check(res.returncode == 1 and "Line 3" in verdict(res), "merged-check: every file in MERGED_CHECK_DENYLIST reaches the audit (%s)" % verdict(res))
+    # a conflict: two edits of the same line
+    for name, text in (("one", "Edited one way.\n"), ("two", "Edited another way.\n")):
+        sh(work, "git", "checkout", "-q", "-b", "edit-" + name, "origin/main")
+        with open(os.path.join(work, "README.md"), "w") as fh:
+            fh.write("# Scratch\n\n" + text)
+        commit("edit " + name)
+    sh(work, "git", "push", "-q", "origin", "edit-one:main")
+    sh(work, "git", "checkout", "-q", "main")
+    res = mc("--head", "edit-two")
+    check(res.returncode != 0 and verdict(res).startswith("merged-check: FAILED merge: ") and "README.md" in verdict(res), "merged-check: a conflicting merge fails and lists the files (%s)" % verdict(res))
+    res = mc("--head", "no-such-branch")
+    check(res.returncode == 2 and verdict(res).startswith("merged-check: FAILED setup: "), "merged-check: an unknown head is a setup failure (2)")
+    # run from a hook: git exports GIT_DIR and GIT_INDEX_FILE, which must not point the scratch repository at the caller's
+    res = mc("--head", "unrelated", env={"GIT_DIR": ".git", "GIT_INDEX_FILE": os.path.join(".git", "index")})
+    check(res.returncode == 0 and verdict(res) == "merged-check: ok", "merged-check: works under a hook's GIT_DIR and GIT_INDEX_FILE (%s)" % verdict(res))
+    # nothing left behind: no scratch directory, no worktree, the caller's branch and tree untouched
+    check(os.listdir(scratch_tmp) == [], "merged-check leaves no scratch directory behind (%s)" % os.listdir(scratch_tmp))
+    check(sh(work, "git", "worktree", "list").stdout.count("\n") == 1, "merged-check leaves no worktree behind")
+    check(sh(work, "git", "rev-parse", "HEAD").stdout == head_before and sh(work, "git", "status", "--porcelain").stdout == status_before,
+          "merged-check leaves the caller's branch and working tree alone")
+
+
+def check(cond, what):
+    print(("ok   " if cond else "FAIL ") + what)
+    if not cond:
+        FAILS.append(what)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--denylist", action="append", default=[], help="a file of names the self-audit must not find; can be repeated")
+    ap.add_argument("--keep", action="store_true", help="leave the temporary directory behind for a look")
+    args = ap.parse_args()
+    tmp = tempfile.mkdtemp(prefix="infirmary-test-")
+    for name in ("SIGTERM", "SIGHUP"):   # a runner that stops the suite (a pipeline's timeout) still gets the directory removed
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _stopped)
+    try:
+        return _main(args, tmp)
+    finally:
+        subprocess.run([PY, os.path.join(ROOT, "examples", "demo-fleet", "make_demo.py"), "--stop", os.path.join(tmp, "fleet")], capture_output=True)   # the demo's two children
+        if args.keep:
+            print("kept %s" % tmp)
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _stopped(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+def _main(args, tmp):
+    env = {"INFIRMARY_STATE": os.path.join(tmp, "state"), "INFIRMARY_CONFIG": os.path.join(tmp, "none.json")}
+    se = os.path.join("bin", "stall-explain")
+    fd = os.path.join("bin", "infirmary")
+
+    # 1. self-audit
+    audit = [os.path.join("scripts", "self-audit")] + [a for d in args.denylist for a in ("--denylist", d)]
+    res = run(audit)
+    check(res.returncode == 0, "self-audit is clean" + ("" if args.denylist else " (no denylist given: names not checked)"))
+
+    # the audit takes any number of denylists and scans its own file like any other (synthetic names, a copy of the script in a scratch tree)
+    fx = os.path.join(tmp, "audit-fixture")
+    os.makedirs(os.path.join(fx, "scripts"))
+    shutil.copy(os.path.join(ROOT, "scripts", "self-audit"), os.path.join(fx, "scripts", "self-audit"))
+    for name, text in (("one.txt", "a line about zebrafruit\n"), ("two.txt", "a line about quokkaberry\n"), ("clean.txt", "nothing to see\n")):
+        with open(os.path.join(fx, name), "w") as fh:
+            fh.write(text)
+    for name, word in (("dl-one.txt", "zebrafruit"), ("dl-two.txt", "quokkaberry")):
+        with open(os.path.join(tmp, name), "w") as fh:
+            fh.write("# a synthetic denylist\n%s\n" % word)
+    both = run([os.path.join(ROOT, "scripts", "self-audit"), "--exempt", "NONE", "--denylist", os.path.join(tmp, "dl-one.txt"), "--denylist", os.path.join(tmp, "dl-two.txt"), fx])
+    check(both.returncode == 1 and "one.txt:1: denylisted name: zebrafruit" in both.stdout and "two.txt:1: denylisted name: quokkaberry" in both.stdout
+          and "4 files scanned, 2 finding(s)" in both.stdout, "self-audit: two --denylist files are both applied, and it scans its own copy (%s)" % both.stdout.strip().splitlines()[-1])
+    only = run([os.path.join(ROOT, "scripts", "self-audit"), "--exempt", "NONE", "--denylist", os.path.join(tmp, "dl-two.txt"), fx])
+    check(only.returncode == 1 and "quokkaberry" in only.stdout and "zebrafruit" not in only.stdout, "self-audit: a name absent from the given denylists is not reported")
+    with open(os.path.join(fx, "scripts", "self-audit"), "a") as fh:
+        fh.write("# zebrafruit\n")
+    own = run([os.path.join(ROOT, "scripts", "self-audit"), "--exempt", "NONE", "--denylist", os.path.join(tmp, "dl-one.txt"), fx])
+    check(own.returncode == 1 and "scripts/self-audit:" in own.stdout and "zebrafruit" in own.stdout, "self-audit: a denylisted name inside the script itself is reported")
+    with open(os.path.join(tmp, "dl-hit.txt"), "w") as fh:
+        fh.write("stall-explain\n")
+    pkg = run([os.path.join("scripts", "build-package"), "--out", os.path.join(tmp, "dist"), "--denylist", os.path.join(tmp, "dl-one.txt"), "--denylist", os.path.join(tmp, "dl-hit.txt")])
+    check(pkg.returncode == 1 and "denylisted name: stall-explain" in pkg.stdout and "refusing to package" in pkg.stderr and not os.path.exists(os.path.join(tmp, "dist")),
+          "build-package: every --denylist reaches the audit, and a finding in the second refuses the package")
+
+    # 2. fixtures
+    exp = json.load(open(os.path.join(ROOT, "examples", "replay", "synthetic.expected.json")))
+    res = run([se, "--replay", os.path.join("src", "infirmary", "explain", "synthetic.jsonl"), "--json", "--gate"], env, expect=0)
+    doc = json.loads(res.stdout)
+    got = {r["id"]: r for r in doc["results"]}
+    for aid, verdict in sorted(exp["verdicts"].items()):
+        want_q = exp.get("qualifiers", {}).get(aid, [])
+        ok = aid in got and got[aid]["verdict"] == verdict and got[aid]["qualifiers"] == want_q
+        check(ok, "synthetic %s is %s%s (got %s)" % (aid, verdict, " " + str(want_q) if want_q else "", got.get(aid, {}).get("verdict")))
+    check(doc["score"]["gate"]["passed"], "synthetic replay gate passes")
+    # 3. the Infirmary's scenarios (POSIX shims: skipped on Windows)
+    if os.name == "nt":
+        print("skip doctor fixtures (they use POSIX tool shims)")
+    else:
+        builders = [os.path.join(ROOT, "examples", "doctor", "fixture.py")] + sorted(glob.glob(os.path.join(ROOT, "examples", "adapter", "*", "fixtures", "*_fixture.py")))
+        for b in builders:
+            if os.path.isfile(b):
+                run_doctor_scenarios(b, tmp)
+    # 4. smoke
+    check(run([se, "--version"], env, expect=0).stdout.startswith("stall-explain "), "stall-explain --version")
+    check(run([se, "--demo"], env, expect=0).returncode == 0, "stall-explain --demo")
+    check(run([fd, "--version"], env, expect=0).stdout.startswith("infirmary "), "infirmary --version")
+    helpdir = os.path.join(tmp, "help-cwd")   # run from a scratch directory: the old behaviour made a directory named --help there and started children
+    os.makedirs(helpdir)
+    res = subprocess.run([PY, os.path.join(ROOT, "examples", "demo-fleet", "make_demo.py"), "--help"], capture_output=True, text=True, cwd=helpdir, timeout=60)
+    check(res.returncode == 0 and "usage:" in res.stdout and os.listdir(helpdir) == [], "make_demo.py --help prints usage and builds nothing")
+    demo = os.path.join(tmp, "fleet")
+    run([os.path.join("examples", "demo-fleet", "make_demo.py"), demo], env, expect=0)
+    lanes = ["--set", "files.lanes=" + os.path.join(demo, "lanes.json")]
+    for lane, code in (("lane-finished", 10), ("lane-waiting", 0), ("lane-gone", 40)):
+        res = run([se, lane] + lanes + ["--json"], env, expect=code)
+        check(res.returncode == code and json.loads(res.stdout)["exit_code"] == code, "%s exits %d and says so in --json" % (lane, code))
+    check(run([se, "lane-quiet", "--idle-s", "3600"] + lanes, env).returncode == 30, "an hour of silence with nothing behind it is wedged (30)")
+    check(run([se, "no-such-lane"] + lanes, env).returncode == 2, "an unknown lane is a usage error (2)")
+    run([fd, "off"], env, expect=0)
+    res = run([se, "lane-finished"] + lanes, env)
+    check(res.returncode == 0 and "off" in res.stdout, "kill switch: stall-explain does nothing while off")
+    run([fd, "on"], env, expect=0)
+    check(run([se, "lane-finished"] + lanes, env).returncode == 10, "kill switch lifted")
+    check(os.path.exists(os.path.join(tmp, "state", "actions.jsonl")), "actions log written to the state directory")
+    # the Infirmary on whatever OS this is: it must answer, name every core check, and never call an unreadable thing fine
+    res = run([fd, "check", "--json", "--no-write"], env)
+    try:
+        doc = json.loads(res.stdout)
+        ids = set(c["check"] for c in doc["checks"])
+        check(res.returncode in (0, 10, 30, 50) and res.returncode == doc["exit_code"] and {"disk-exhaustion", "memory-swap", "hung-host", "clobbered-checkout"} <= ids,
+              "infirmary check answers on this OS (%s) with exit %d" % (doc["host"]["os"], res.returncode))
+        check(all(c["state"] in ("ok", "finding", "unknown", "skipped", "error") for c in doc["checks"]) and all(c["detail"] for c in doc["checks"]),
+              "every check says what it saw or why it could not")
+    except (ValueError, KeyError):
+        check(False, "infirmary check --json prints a document: %s" % (res.stdout + res.stderr)[-200:])
+    check(run([fd, "status"], env, expect=0).stdout.startswith("infirmary "), "infirmary status")
+    # the repair verbs answer on this OS: live repair is off until the operator's command, repair mode is not a setting,
+    # --no-write acts on nothing even with the toggle on, an unknown plan is refused
+    st = json.loads(run([fd, "status", "--json"], env, expect=0).stdout)
+    check(st["repair_mode"] == "advice-only" and st["live_repair"]["enabled"] is False, "a fresh state directory is advice-only (live repair off)")
+    check(run([fd, "check", "--set", "mode=repair"], env).returncode == 2, "mode=repair is not a setting (2)")
+    check(run([fd, "status"], dict(env, INFIRMARY_MODE="repair")).returncode == 2, "INFIRMARY_MODE=repair is not a setting (2)")
+    check(run([fd, "live", "on", "--by", "smoke"], env, expect=0).returncode == 0, "infirmary live on")
+    st = json.loads(run([fd, "status", "--json"], env, expect=0).stdout)
+    check(st["repair_mode"] == "live-repair" and st["live_repair"]["by"] == "smoke", "status reports live-repair after the operator turned it on")
+    res = run([fd, "check", "--json", "--no-write"], env)
+    try:
+        doc = json.loads(res.stdout)
+        check(res.returncode == doc["exit_code"] and doc["repair_mode"] == "advice-only" and doc["repairs"]["mode"] == "advise" and all(o["outcome"] == "advised" for o in doc["repairs"]["outcomes"]),
+              "check --no-write only advises, even with live repair on")
+    except (ValueError, KeyError):
+        check(False, "check --no-write prints a document: %s" % (res.stdout + res.stderr)[-200:])
+    check(run([fd, "live", "off", "--by", "smoke"], env, expect=0).returncode == 0, "infirmary live off")
+    st = json.loads(run([fd, "status", "--json"], env, expect=0).stdout)
+    check("breakers" in st and "plans" in st, "status --json reports breakers and plans")
+    check(run([fd, "plans"], env, expect=0).returncode == 0, "infirmary plans")
+    res = run([fd, "approve", "no-such-plan", "--json"], env, expect=1)
+    check(res.returncode == 1 and json.loads(res.stdout)["outcome"] == "refused", "approving a plan that does not exist is refused (1)")
+    check(run([fd, "check", "--set", "mode=fix-everything"], env).returncode == 2, "an unknown mode is a usage error (2)")
+    check(run([fd, "check", "--set", "doctor.repair.actions.some-action=run"], env).returncode == 2, "configuration cannot promote an action (2)")
+    # 5. scripts/merged-check
+    if os.name != "nt":
+        merged_check_scenarios(tmp)
+    print("\n%d failure(s)" % len(FAILS) if FAILS else "\nall passed")
+    for f in FAILS:
+        print(" -", f)
+    return 1 if FAILS else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

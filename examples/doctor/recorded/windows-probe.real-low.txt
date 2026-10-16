@@ -1,0 +1,1 @@
+INFIRMARY {"host":"WIN-BOX","os":"Microsoft Windows 11 Home","total_mb":32189,"avail_mb":884,"commit_pct":88,"procs":329,"old_bash":0,"old_sshd":0,"old_powershell":0,"vmmem_mb":19083,"vmmem_n":1,"wslconfig":["memory=24GB","swap=16GB"],"uptime_h":8.4}

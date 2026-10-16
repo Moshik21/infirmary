@@ -1,0 +1,18 @@
+{
+  "mode": "advise",
+  "doctor": {
+    "hosts": [
+      {"id": "win-box", "ssh": "win-box", "os": "windows", "guest": {"ssh": "win-box-wsl", "id": "wsl"},
+       "expect": {"shell": "powershell", "gpu": ["RTX"], "gpu_preference": {"chrome.exe": "high"}, "tools": {"node": ">=20", "git": true}}},
+      {"id": "build-vm", "ssh": "build-vm", "os": "linux", "guest": {"ssh": "build-vm-guest", "id": "vm"}}
+    ],
+    "disk": {"paths": [{"path": "~", "label": "home", "warn_gb": 60, "crit_gb": 20}]},
+    "memory": {"orphans": {"names": ["my-job-server"], "min_age_s": 1800, "min_rss_mb": 200}},
+    "ssh_check": {"aliases": ["mate-box"], "from_hosts": true, "from_ssh_config": false, "exclude": ["git-forge"]},
+    "channels": {"control_sockets": ["~/.ssh/cm-*"]},
+    "for_s": {"memory-pressure": 120},
+    "dry_runs": false,
+    "repair": {"actions": {}, "host_per_hour": 3, "action_per_hour": 2, "finding_per_hour": 1, "breaker_open_findings": 4, "breaker_failures": 2, "plan_ttl_s": 3600}
+  },
+  "lookout": {"enabled": false, "transport": "http", "target": "http://127.0.0.1:8787", "token_file": "~/.config/lookout/doctor.token"}
+}

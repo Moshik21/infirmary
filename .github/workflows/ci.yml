@@ -1,0 +1,20 @@
+# Run by hand from the Actions tab: hosted CI minutes are budgeted, so no push or pull request starts it.
+name: ci
+on: workflow_dispatch
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.8", "3.13"]
+        exclude:
+          - os: macos-latest        # no Python 3.8 build for Apple Silicon runners
+            python: "3.8"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python scripts/test

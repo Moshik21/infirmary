@@ -1,0 +1,9 @@
+{
+ "about": "What each invented alarm in synthetic.jsonl must be called. Written by hand from the alarm's note, not generated.",
+ "verdicts": {
+  "s01": "waiting-on-supervisor", "s02": "waiting-on-supervisor", "s03": "declared-wait", "s04": "running-long",
+  "s05": "running-remote", "s06": "running-remote", "s07": "queued", "s08": "thinking", "s09": "waiting-on-human",
+  "s10": "wedged", "s11": "dead", "s12": "torn-down", "s13": "unknown", "s14": "wedged", "s15": "running-long"
+ },
+ "qualifiers": {"s06": ["slow-host"], "s08": ["busy-attested"]}
+}

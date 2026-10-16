@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infirmary"
+dynamic = ["version"]
+description = "Explain why an agent lane is quiet, and keep a fleet healthy through its owners' own safe repairs."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Moshik21" }]
+dependencies = []
+
+[project.urls]
+Source = "https://github.com/Moshik21/infirmary"
+Issues = "https://github.com/Moshik21/infirmary/issues"
+
+[project.scripts]
+infirmary = "infirmary.cli:main"
+stall-explain = "infirmary.explain.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "infirmary.VERSION" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"infirmary.explain" = ["synthetic.jsonl"]
+"infirmary.doctor" = ["windows/*.ps1"]

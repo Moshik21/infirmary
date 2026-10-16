@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""A fake `ssh` for the Infirmary's fixture tests. Behaviour is chosen by the host alias in the arguments; it never
+connects anywhere. Aliases: win-ok / win-low (recorded probe output), linux-ok, hung-host (login times out, the
+port accepts and stays silent), down-host (nothing listens), auth-host (the port greets, the login is refused).
+`win2-ok` is the recorded answer of the version-2 Windows probe; any other `win2-NAME` answers with $INFIRMARY_PROBES/win2-NAME.txt (derived
+from that recording by the fixture builder). A Windows probe is refused unless it arrives the way the product sends it: a short command line
+and ONE line on standard input that decodes to a script with no verb that changes anything on the host.
+`win2-NAME` also appends $INFIRMARY_PROBES/win2-NAME.platform.txt when the script carries the platform block (catalogue 23 to 27). `guest-nohv` is a
+guest whose WSL cannot start for want of a hypervisor.
+`check-hold` is a Tailscale SSH style additional-check prompt (banner with a login URL, then the connection waits until it is killed), `check-closed` prints
+the same and closes, `check-nourl` prints the message without a URL, `look-alike` has a banner that talks about checks and a URL but is no prompt (and logs in).
+Every probe must arrive the way the product sends it (BatchMode, a connect timeout, no control master, the no-op `echo`) or it is refused; when
+$INFIRMARY_SSH_LOG is set each attempt's alias is appended there, so a test can count the connections made.
+`-G alias` prints the resolved endpoint; `-O check -S <socket>` answers for control sockets."""
+import base64
+import os
+import re
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REC = os.path.join(HERE, "..", "recorded")
+args = sys.argv[1:]
+if "-G" in args:
+    alias = args[args.index("-G") + 1]
+    port = {"hung-host": os.environ.get("INFIRMARY_PORT_SILENT"), "auth-host": os.environ.get("INFIRMARY_PORT_BANNER"),
+            "down-host": os.environ.get("INFIRMARY_PORT_CLOSED")}.get(alias, "22")
+    print("hostname 127.0.0.1\nport %s" % port)
+    sys.exit(0)
+if "-O" in args:
+    sock = args[args.index("-S") + 1]
+    if "live" in os.path.basename(sock):
+        print("Master running (pid=4242)")
+        sys.exit(0)
+    sys.stderr.write("Control socket connect(%s): Connection refused\n" % sock)
+    sys.exit(255)
+CHECK_ALIASES = ("check-hold", "check-closed", "check-nourl", "look-alike", "check-guest")
+alias = [a for a in args if a in ("win-ok", "win-low", "linux-ok", "hung-host", "down-host", "auth-host", "guest-dead", "guest-ok", "guest-nohv") + CHECK_ALIASES or a.startswith("win2-")]
+alias = alias[0] if alias else ""
+sys.path.insert(0, HERE)
+import psguard  # noqa: E402
+
+
+def refuse(why):
+    psguard.refuse(why)
+
+
+def check_windows_transport():
+    cmd = args[-1]
+    stdin = sys.stdin.read()
+    if len(cmd) > 8000 or not cmd.startswith("powershell -NoProfile -NonInteractive -Command -"):
+        refuse("the remote command is not the short powershell line (%d chars)" % len(cmd))
+    return psguard.decode(stdin)
+
+
+if alias and os.environ.get("INFIRMARY_SSH_LOG"):
+    with open(os.environ["INFIRMARY_SSH_LOG"], "a") as log:
+        log.write(alias + "\n")
+if alias in CHECK_ALIASES or alias in ("linux-ok", "guest-ok", "auth-host", "hung-host", "down-host", "guest-dead"):
+    opts = " ".join(args)
+    if args[-1].startswith("powershell"):
+        pass     # a Windows host is asked its own question; the transport check below judges it
+    elif "BatchMode=yes" not in args or not re.search(r"ConnectTimeout=\d+", opts) or "ControlPath=none" not in args or args[-1] != "echo infirmary-ok":
+        refuse("a probe must be BatchMode, with a connect timeout, no control master and the no-op echo (got %r)" % args)
+PROMPT = "# Tailscale SSH requires an additional check.\n# To authenticate, visit: https://login.example.invalid/a/0123456789ab\n"
+if alias in ("check-hold", "check-closed", "check-nourl", "check-guest"):
+    sys.stderr.write(PROMPT if alias != "check-nourl" else "# Tailscale SSH requires an additional check.\n")
+    sys.stderr.flush()
+    if alias == "check-hold":
+        time.sleep(120)
+    sys.stderr.write("Connection closed by 127.0.0.1 port 22\n")
+    sys.exit(255)
+if alias == "look-alike":
+    sys.stderr.write("# Please check https://status.example.invalid before you log in; an additional check of your quota ran.\n")
+    print("infirmary-ok")
+    sys.exit(0)
+if alias.startswith("win2-"):
+    script = check_windows_transport()
+    path = os.path.join(REC, "windows-probe.v2.real.txt") if alias == "win2-ok" else os.path.join(os.environ.get("INFIRMARY_PROBES", ""), alias + ".txt")
+    noise = os.path.join(os.environ.get("INFIRMARY_PROBES", ""), alias + ".stderr")     # what the host's login shell prints before the probe runs
+    plat = os.path.join(os.environ.get("INFIRMARY_PROBES", ""), alias + ".platform.txt")  # the platform block (catalogue 23 to 27), when the script asks for it
+    if os.path.isfile(noise):
+        sys.stderr.write(open(noise).read())
+    try:
+        sys.stdout.write(open(path).read())
+    except OSError:
+        refuse("no recorded or derived probe answer for %s" % alias)
+    if "INFIRMARY_PLATFORM" in script and os.path.isfile(plat):
+        sys.stdout.write(open(plat).read())
+    sys.exit(0)
+if alias in ("win-ok", "win-low"):
+    check_windows_transport()
+    name = "windows-probe.real.txt" if alias == "win-ok" else "windows-probe.real-low.txt"
+    sys.stdout.write(open(os.path.join(REC, name)).read())
+    sys.exit(0)
+if alias in ("linux-ok", "guest-ok"):
+    print("infirmary-ok")
+    sys.exit(0)
+if alias == "auth-host":
+    sys.stderr.write("user@127.0.0.1: Permission denied (publickey).\n")
+    sys.exit(255)
+if alias == "hung-host":
+    sys.stderr.write("Connection timed out during banner exchange\nconnect to host 127.0.0.1 port 22: Connection timed out\n")
+    sys.exit(255)
+if alias == "guest-nohv":     # a guest reached through its Windows host's wsl, which cannot start without a hypervisor
+    sys.stderr.write("The Virtual Machine Platform is not available: enable virtualization in the firmware.\nError code: Wsl/Service/CreateInstance/CreateVm/HCS/HCS_E_HYPERV_NOT_INSTALLED\n")
+    sys.exit(1)
+if alias in ("down-host", "guest-dead"):
+    sys.stderr.write("ssh: connect to host 127.0.0.1 port 22: Connection timed out\n")
+    sys.exit(255)
+sys.stderr.write("fake ssh: unknown alias in %r\n" % args)
+sys.exit(1)

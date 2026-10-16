@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""A fake `powershell.exe` for the Infirmary's fixture tests of catalogue 23 to 27 read from this machine's own Windows side (a WSL guest or
+Windows itself). It runs nothing: it accepts the platform script only the way the product sends it and only when it is read-only (see
+psguard.py), then prints $INFIRMARY_PLATFORM_ANSWER (a `INFIRMARY_PLATFORM {json}` line the fixture builder wrote). With no answer file it
+fails the way a WSL guest without interop does."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import psguard  # noqa: E402
+
+if sys.argv[1:] != ["-NoProfile", "-NonInteractive", "-Command", "-"]:
+    psguard.refuse("unexpected arguments %r" % sys.argv[1:])
+script = psguard.decode(sys.stdin.read())
+if "INFIRMARY_PLATFORM" not in script:
+    psguard.refuse("this is not the platform script")
+answer = os.environ.get("INFIRMARY_PLATFORM_ANSWER", "")
+if not os.path.isfile(answer):
+    sys.stderr.write("-bash: powershell.exe: cannot execute binary file: Exec format error\n")
+    sys.exit(126)
+sys.stdout.write(open(answer).read())
