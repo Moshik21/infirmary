@@ -12,7 +12,7 @@
 | `unknown [stale-declaration]` | the lane's last declaration (a wait, or done, failed, blocked, needs-decision) is older than the machine's last boot or the lane's newest agent session (or the source could not date those), so it is not evidence of a wait or of a supervisor-owed move; look at the lane |
 | `unknown`: "the lane map at the alarm's moment cannot be reconstructed" | the lane's record is gone or was replaced by a relaunch, and the ledger does not show it cleaned up by then; it is never read as `torn-down` |
 | `thinking [busy-attested]` | the only evidence is the watcher's record that a doorbell was deferred because the agent was busy; no activity sample corroborates it |
-| CPU and process-tree fields empty | no `/proc` on this OS; verdicts from files still work |
+| CPU and process-tree fields empty, or `evidence incomplete (process unavailable: …)` | the process table could not be read: no `/proc`, `ps` (macOS) or PowerShell (Windows), or the reader timed out or printed something it could not parse; the reason follows the colon. Verdicts from files still work |
 | `stall-explain is off (kill switch)` | `infirmary on`, or unset `INFIRMARY` |
 | a TOML config is rejected | TOML needs Python 3.11+ (`tomllib`); use JSON on older Pythons |
 | a check says `unknown` | it could not read what it needs (no `/proc` and no `ps`, or no memory reading on this OS); the detail says which. It is never reported as fine |

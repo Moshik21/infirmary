@@ -1,7 +1,7 @@
 # Evidence: `infirmary.evidence 1.0`
 
-The engine is a pure function of one evidence dict. A source fills it from local files and `/proc`
-within the time budget; a replay file embeds it. Every key is optional except `subject`.
+The engine is a pure function of one evidence dict. A source fills it from local files and the process table (`/proc`, `ps` on
+macOS, `Win32_Process` on Windows; [verdicts.md](verdicts.md#process-evidence-by-platform)) within the time budget; a replay file embeds it. Every key is optional except `subject`.
 
 | Key | Shape | Meaning |
 | --- | --- | --- |

@@ -253,6 +253,6 @@ def _more(act, agent):
 
 
 def _incomplete(done, failed, facts):
-    names = ", ".join("%s %s" % (s["name"], s["status"]) for s in failed)
+    names = ", ".join("%s %s%s" % (s["name"], s["status"], ": " + s["note"] if s["status"] == "unavailable" and s.get("note") else "") for s in failed)   # an unreadable source says why
     facts.append({"source": "collectors", "fact": names})
     return done("unknown", "evidence incomplete (%s); silence alone proves nothing" % names, "run again, or look at the lane")

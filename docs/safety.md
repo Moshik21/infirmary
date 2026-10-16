@@ -36,7 +36,7 @@ run wrote. The install has no repair option and writes no live-repair record. Wh
 mode whatever the toggle says.
 
 **What is read.** Whatever the source is configured to read, as the invoking user, with no privilege. The Infirmary reads
-`/proc` (or runs `ps`, `vm_stat`, `sysctl` on macOS), the adapter's home, pool, remote-job and gate state, and a
+`/proc` (or runs `ps`, `vm_stat`, `sysctl` on macOS, and on Windows one fixed PowerShell script that lists `Win32_Process`), the adapter's home, pool, remote-job and gate state, and a
 checkout's `node_modules` *directory names*. From another process's environment it keeps only the named variables it
 needs (a home or state path), never the rest. From a process's descriptors and working
 directory it reads only where the links point (to tell whether scratch or a slot file is still in use), never the files. Process arguments are not printed: a finding shows the executable, the

@@ -29,6 +29,28 @@ The first rule with **positive evidence** wins. `facts` that were seen go into `
 10. **declared-wait**: the newest declaration is `paused`, and it is newer than the machine's last boot and than the lane's newest agent session (the same floor as step 9). If it states a length ("about 1-2h" or "until 2026-10-08T21:30Z") and `declared_wait_grace_factor` times that has passed, the answer is `unknown` (overdue).
 11. **wedged / unknown from silence**: with an idle time known (from the trigger or `--idle-s`): `wedged` when idle at least `wedge_min_s` and nothing running, queued, growing or declared; otherwise `unknown`, "quiet N, below the wedge floor". A source that failed or timed out turns `wedged` into `unknown` ("evidence incomplete"): silence plus a broken reader proves nothing.
 
+## Process evidence by platform
+
+`dead` and `wedged` rest on the process table, read only, never by signalling anything (`src/infirmary/core/proc.py`):
+
+| | Where it is read | Identity (start time) | CPU |
+| --- | --- | --- | --- |
+| Linux, WSL2 | `/proc` | clock ticks since boot | `/proc/<pid>/stat` |
+| macOS | `ps -axo pid=,ppid=,time=,lstart=` with `TZ=UTC LC_ALL=C`, and `ps -ww -p <pid> -o command=` for the one command line | `lstart`, to the second | `time`, in hundredths |
+| Windows | `Get-CimInstance Win32_Process` in one fixed PowerShell script (`powershell.exe -NoProfile -NonInteractive -EncodedCommand`); the pid and the sample gap arrive as environment variables read as integers | `CreationDate` as a FILETIME | `KernelModeTime` + `UserModeTime` |
+
+A pid that is absent from a table read whole is gone, so `dead` holds there as on Linux. The table is unread, and the answer
+`unknown` with the reason ("evidence incomplete (process unavailable: ps timed out after 3s)"), when the platform has no reader,
+the tool is missing, exits non-zero or times out, any row does not parse, or the output reaches the read cap; a Windows answer
+also carries a row count, so a cut-off one never parses. A process that is there with the recorded start time but whose command
+line cannot be read (Windows shows another user's only with elevation) is `unknown`, not `dead` and not alive. Windows keeps a dead
+parent's id, which a younger process may reuse, so a process older than its claimed parent is not counted in that parent's tree.
+
+Off Linux the source takes the identity, the CPU sample and the tree from one read. On Windows that read starts PowerShell: about
+0.6 s, and 1.3 s with the CPU sample, on a Windows 11 PC, so a verdict is over the 1 s `budget_ms` and, on a slower machine, can
+pass `hard_cap_ms` and read `unknown`. A lane's slot-holder pids are each one more read. Neither launchd nor the Windows Task
+Scheduler is read: no rule here uses a scheduler's state, only the agent's process.
+
 ## Thresholds (all in `config.py` DEFAULTS, all `--set`-able)
 
 | Name | Default | What it is |

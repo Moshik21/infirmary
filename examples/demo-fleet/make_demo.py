@@ -12,7 +12,7 @@ process sits idle (add --idle-s 3600 to say it has been silent an hour: wedged),
 process is gone (dead). The children's pids are written to DIR/pids.json; `--stop DIR` ends exactly those
 pids (each only if it is still the process that was recorded, never by name or pattern) and removes the file.
 Anything that builds a demo should call `--stop DIR` when it is done, also on failure. Standard library only; works on Linux, WSL and macOS (the CPU
-and process-identity reads need /proc, so on macOS that lane reports less).
+and process-identity reads use /proc there, and `ps` on macOS).
 """
 import argparse
 import json

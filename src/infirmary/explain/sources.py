@@ -90,7 +90,9 @@ class FilesSource:
             evidence.mark(ev, "declarations", "ok" if rows is not None else "unavailable", (time.monotonic() - t0) * 1000)
         t0 = time.monotonic()
         ag = spec.get("agent")
-        if ag:
+        if ag and not proc.HAVE_PROC:
+            self._agent_elsewhere(ev, ag, clock, th, t0)
+        elif ag:
             alive = proc.same(ag)
             ev["agent"] = {"alive": alive, "source": "process identity", "state": ag.get("state", "unknown"), "pid": ag.get("pid")}
             if alive and clock.left() > th["cpu_sample_ms"] / 1000.0 + 0.1:
@@ -110,6 +112,22 @@ class FilesSource:
             if b:
                 ev["hosts"][name] = {"beat_age_s": b["age_s"], "level": b["level"], "canary_ok": hv.get("canary_ok", True)}
         return ev
+
+    def _agent_elsewhere(self, ev, ag, clock, th, t0):
+        """macOS and Windows: the identity, the CPU sample and the tree from one read of the process table (proc.look)."""
+        sample = th["cpu_sample_ms"] if clock.left() > th["cpu_sample_ms"] / 1000.0 + 0.1 else None
+        got = proc.look(ag, sample)
+        alive = got["alive"]
+        ev["agent"] = {"alive": alive, "source": "process identity", "state": ag.get("state", "unknown"), "pid": ag.get("pid")}
+        if alive and sample:
+            ev["agent"]["cpu_cores"], ev["agent"]["descendants"] = got["cpu_cores"], got["descendants"]
+            if got["cpu_cores"] is None:     # not measured is not idle
+                evidence.mark(ev, "process sample", "unavailable", 0, proc.why or "the CPU sample could not be taken")
+            elif got["cpu_cores"] >= th["busy_cpu_cores"]:
+                ev["agent"]["state"] = "busy"
+        elif alive:
+            evidence.mark(ev, "process sample", "timeout", 0, "no time left for the CPU sample")
+        evidence.mark(ev, "process", "ok" if alive is not None else "unavailable", (time.monotonic() - t0) * 1000, None if alive is not None else proc.why)
 
     def _queues(self, ev, spec, lane_id, now):
         for cls in spec.get("queue_classes") or []:

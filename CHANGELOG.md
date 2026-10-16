@@ -5,6 +5,18 @@ All notable changes to this project are recorded here. The format follows
 [semantic versioning](https://semver.org/). Schema versions (`infirmary.verdict`, `infirmary.evidence`,
 `infirmary.replay`) are versioned separately from the tool.
 
+## [0.4.1] - 2026-10-16
+
+- **macOS and Windows read their own process table.** `dead` and `wedged` need the agent's process identity and CPU, which came only from
+  `/proc`, so on macOS and Windows a lane that was gone or silent read `unknown` (exit 50, "process unavailable"). macOS now reads `ps`
+  (`TZ=UTC LC_ALL=C`, start time and CPU from the whole table, the one command line by pid) and Windows reads `Win32_Process` through one
+  fixed, read-only PowerShell script. A reader that is missing, times out or prints anything it cannot parse whole still gives `unknown`,
+  and the verdict now says why ("process unavailable: ps timed out after 3s"). Off Linux the identity, the CPU sample and the tree come
+  from one read; on Windows that read starts PowerShell (about 1.3 s with the CPU sample on a Windows 11 PC), so a verdict there is over
+  the 1 s target and on a slower machine can reach the 2 s cap and read `unknown`. Linux and WSL2 read `/proc` exactly as before.
+  Run by `scripts/test` on Linux/WSL2 and on a Windows 11 PC, and the Windows reader against live processes; the macOS reader was run
+  read-only on a Mac and its parser against synthetic output, not by `scripts/test` on a Mac. The hosted matrix has not run this release.
+
 ## [0.4.0] - 2026-10-16
 
 The first public release. It folds in everything recorded since 0.3.0 (below), and it is a breaking release: the rename from Fleet Doctor to Infirmary

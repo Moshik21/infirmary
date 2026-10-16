@@ -9,7 +9,8 @@
    each replayed through `bin/infirmary` (check, plan, approve, reset, on, off) with the findings (and the look-alikes it
    must leave alone), the repairs it ran or refused, its actions log and its plans compared
 4. a smoke run: start, one explanation, --json, the exit codes, the kill switch, a refused unknown lane, and the repair verbs
-   (repair mode under --no-write only advises, an unknown plan is refused, a bad mode or a promoted action is a usage error)
+   (repair mode under --no-write only advises, an unknown plan is refused, a bad mode or a promoted action is a usage error);
+   and, the one look at internals, the macOS and Windows process-table parsers against synthetic output in the tools' formats
 5. scripts/merged-check on a scratch git repository: two branches clean alone whose merge fails the audit, a conflicting merge,
    a clean merge, and nothing left behind
 
@@ -685,15 +686,47 @@ def _main(args, tmp):
     for lane, code in (("lane-finished", 10), ("lane-waiting", 0)):
         res = run([se, lane] + lanes + ["--json"], env, expect=code)
         check(res.returncode == code and json.loads(res.stdout)["exit_code"] == code, "%s exits %d and says so in --json" % (lane, code))
-    if os.path.isdir("/proc/self"):
-        res = run([se, "lane-gone"] + lanes + ["--json"], env, expect=40)
+    if os.path.isdir("/proc/self") or sys.platform == "darwin" or os.name == "nt":   # a process reader: /proc, `ps`, or PowerShell's Win32_Process
+        # each Windows read starts PowerShell (about 1.3 s for the sampled read on a Windows 11 PC): these checks are about the verdict,
+        # so there they get room, and the answer under the default budget is printed, not judged
+        room = ["--set", "budget_ms=5000", "--set", "hard_cap_ms=10000"] if os.name == "nt" else []
+        res = run([se, "lane-gone"] + room + lanes + ["--json"], env, expect=40)
         check(res.returncode == 40 and json.loads(res.stdout)["exit_code"] == 40, "lane-gone exits 40 and says so in --json")
-        check(run([se, "lane-quiet", "--idle-s", "3600"] + lanes, env).returncode == 30, "an hour of silence with nothing behind it is wedged (30)")
-    else:   # dead and wedged need the process read, which is /proc only: here it is unavailable, and the answer must say so, not guess
+        check(run([se, "lane-quiet", "--idle-s", "3600"] + room + lanes, env).returncode == 30, "an hour of silence with nothing behind it is wedged (30)")
+        if room:
+            res = run([se, "lane-quiet", "--idle-s", "3600"] + lanes + ["--json"], env)
+            try:
+                doc = json.loads(res.stdout)
+                print("info lane-quiet under the default budget: %s in %d ms (%s)" % (doc["verdict"], doc["cost"]["took_ms"], doc["why"]))
+            except (ValueError, KeyError):
+                print("info lane-quiet under the default budget printed no verdict: %s" % (res.stdout + res.stderr)[-200:])
+    else:   # no process reader for this platform: the process is unavailable, and the answer must say so, not guess
         for lane, extra in (("lane-gone", []), ("lane-quiet", ["--idle-s", "3600"])):
             res = run([se, lane] + extra + lanes + ["--json"], env, expect=50)
             check(res.returncode == 50 and "process unavailable" in json.loads(res.stdout)["why"],
-                  "%s is unknown (50) without /proc, and says the process could not be read" % lane)
+                  "%s is unknown (50) with no process reader, and says the process could not be read" % lane)
+    # the macOS `ps` and Windows Win32_Process parsers, on every platform, against synthetic output in the tools' real formats
+    rec = os.path.join(ROOT, "examples", "doctor", "recorded")
+    parse = ("import json, sys\nsys.path.insert(0, 'src')\nfrom infirmary.core import proc\ntext = open(sys.argv[2], encoding='utf-8').read()\n"
+             "got = proc.parse_ps(text) if sys.argv[1] == 'ps' else proc.parse_cim(text)\n"
+             "print(json.dumps(got if got is None or sys.argv[1] == 'ps' else dict(got, tree=proc.descendants(5000, got['samples'][0]))))")
+    mac_ps = os.path.join(rec, "process-table.macos-ps.txt")
+    got = json.loads(run(["-c", parse, "ps", mac_ps], expect=0).stdout)
+    check(got is not None and len(got) == 6 and got["1"] == {"ppid": 0, "ticks": 1071951, "starttime": 1791465950, "start": 1791465950}
+          and got["4121"]["ppid"] == 4120 and got["4121"]["ticks"] == 72140, "macOS ps table: every row parsed, CPU time and the UTC start time exact")
+    with open(os.path.join(tmp, "ps-cut.txt"), "w") as fh:
+        fh.write(open(mac_ps).read().replace("Fri Oct 16 21:01:10 2026", "Fri Oct 16 21:01"))
+    check(json.loads(run(["-c", parse, "ps", os.path.join(tmp, "ps-cut.txt")], expect=0).stdout) is None, "macOS ps table: one row that does not parse makes the whole table unread")
+    win_cim = os.path.join(rec, "process-table.windows-cim.txt")
+    got = json.loads(run(["-c", parse, "cim", win_cim], expect=0).stdout)
+    check(got is not None and [len(x) for x in got["samples"]] == [7, 7] and got["elapsed"] == 0.508 and got["cmdline"] == 'C:\\Tools\\agent.exe --lane "demo lane" --note caf\u00e9'
+          and got["samples"][0]["5000"]["starttime"] == 134366585000000000 and got["samples"][1]["5004"]["ticks"] == 22500000,
+          "Windows process table: both samples, the gap between them, start times and the command line")
+    check(got is not None and got["tree"] == [5004] and got["samples"][0]["6000"]["ppid"] is None,
+          "Windows process table: a process older than its claimed parent (a reused parent id) is not in that parent's tree")
+    with open(os.path.join(tmp, "cim-cut.txt"), "w") as fh:
+        fh.write(open(win_cim).read().replace("P 6000 5000 134366580000000000 35000000\n", ""))
+    check(json.loads(run(["-c", parse, "cim", os.path.join(tmp, "cim-cut.txt")], expect=0).stdout) is None, "Windows process table: a sample with a row missing is unread")
     check(run([se, "no-such-lane"] + lanes, env).returncode == 2, "an unknown lane is a usage error (2)")
     run([fd, "off"], env, expect=0)
     res = run([se, "lane-finished"] + lanes, env)
