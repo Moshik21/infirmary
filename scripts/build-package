@@ -8,9 +8,12 @@ outside the repository; `--denylist` can be repeated and every file reaches the 
 contributing, security and support notes; not the migration guide for the old names) under one top-level folder, so it unzips cleanly on Windows, macOS
 and Linux. It never includes adapters for specific tools, scripts, tests or anything ignored by git.
 The Windows launchers are written with CRLF line endings and the POSIX launchers are marked
-executable. Same input, same bytes. Standard library only.
+executable. Same input, same bytes: every entry is stamped with one fixed time, SOURCE_DATE_EPOCH when set, else the commit time of HEAD, else (not a git
+checkout, e.g. an unzipped source tree) 1980-01-01, so two clones of the same commit give the same zip, whatever the files' mtimes. The build prints the stamp.
+Standard library only.
 """
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -29,14 +32,27 @@ def version():
 
 
 def files():
-    out = []
+    out = []   # entries sorted by name parts, case-sensitively: sorted(Path) folds case on Windows and would order the zip differently there
     for item in INCLUDE:
         path = ROOT / item
         if path.is_file():
             out.append(path)
         elif path.is_dir():
-            out += [p for p in sorted(path.rglob("*")) if p.is_file() and not (SKIP_PARTS & set(p.relative_to(ROOT).parts)) and p.suffix != ".pyc"]
+            out += [p for p in sorted(path.rglob("*"), key=lambda p: p.relative_to(ROOT).parts) if p.is_file() and not (SKIP_PARTS & set(p.relative_to(ROOT).parts)) and p.suffix != ".pyc"]
     return out
+
+
+def stamp_epoch():
+    """The one time every zip entry carries: not the working tree's mtimes, which differ between clones of the same commit."""
+    if os.environ.get("SOURCE_DATE_EPOCH", "").strip():
+        return max(int(os.environ["SOURCE_DATE_EPOCH"]), 315532800)
+    try:
+        git = lambda *a: subprocess.run(["git", "-C", str(ROOT), *a], capture_output=True, text=True, check=True).stdout.strip()
+        if Path(git("rev-parse", "--show-toplevel")).resolve() == ROOT:  # ROOT itself is the checkout, not a folder inside another repository
+            return max(int(git("log", "-1", "--format=%ct", "HEAD")), 315532800)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        pass
+    return 315532800  # 1980-01-01, the earliest time a zip entry can hold (earlier epochs are raised to it)
 
 
 def main():
@@ -55,7 +71,9 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / (top + ".zip")
-    stamp = time.gmtime(max(p.stat().st_mtime for p in files()))[:6]
+    epoch = stamp_epoch()
+    stamp = time.gmtime(epoch)[:6]
+    print("entry time " + time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(epoch)))
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in files():
             rel = path.relative_to(ROOT).as_posix()
@@ -64,6 +82,7 @@ def main():
                 data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
             info = zipfile.ZipInfo("%s/%s" % (top, rel), date_time=stamp)
             info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3   # the same "made on Unix" header from any OS (zipfile writes 0 on Windows), as the permissions below say
             info.external_attr = (0o755 if rel in EXEC else 0o644) << 16
             zf.writestr(info, data)
     print("%s (%d KiB, %d files)" % (target, target.stat().st_size // 1024, len(files())))

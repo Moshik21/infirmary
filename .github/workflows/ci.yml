@@ -12,6 +12,7 @@ jobs:
           - os: macos-latest        # no Python 3.8 build for Apple Silicon runners
             python: "3.8"
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 5   # the slowest hosted leg took 78 s; 5 min is 3x that, rounded up. A hung leg stops here, not at the 360-minute default
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
